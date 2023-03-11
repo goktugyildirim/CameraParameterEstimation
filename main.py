@@ -30,7 +30,7 @@ def project_point(object_point, rvec, tvec, camera_matrix):
     return u, v
 
 
-def LM7DoF(object_points, image_points, rvec0, tvec0, camera_matrix, iterations):
+def LM7DoF(object_points, image_points, rvec0, tvec0, camera_matrix, iterations, log=False):
     num_pairs = len(object_points)
 
     dist_coeff = np.zeros((4, 1))
@@ -38,47 +38,39 @@ def LM7DoF(object_points, image_points, rvec0, tvec0, camera_matrix, iterations)
     imagePoints0 = imagePoints0.reshape(-1, 2)
     err0 = np.linalg.norm(imagePoints0 - image_points)
 
-    print("SE3 Initial Translation: \n", tvec0)
-    print("SE3 Initial Rotation: \n", rvec0)
-    print("Initial focal length: ", camera_matrix[0, 0], camera_matrix[1, 1])
-    print("Initial reprojection error: ", err0)
-    print("-------------------------------------------")
+    if log:
+        print("SE3 Initial Translation:", tvec0, " | SE3 Initial Rotation:", rvec0, " | Focal length: ",
+              camera_matrix[0, 0],
+              " | Reprojection error: ", np.round(err0, 4))
+        print("-------------------------------------------")
 
     lmbda = 1e-3
-    total_time_jac_compute = 0
-    total_time_solve = 0
-    t_start0 = time.time()
-    for i in range(iterations):
+    err0 = 0
+    for iter in range(iterations):
         object_points = object_points.reshape((num_pairs, 3))
         image_points = image_points.reshape((num_pairs, 2))
-        t_start = time.time()
         projected_points, J = cv2.projectPoints(object_points, rvec0, tvec0,
                                                 camera_matrix, dist_coeff, aspectRatio=1,
                                                 jacobian=True)
-        t_end = time.time()
-        total_time_jac_compute += np.round((t_end - t_start) * 1000, 3)
+
         projected_points = projected_points.reshape((num_pairs, 2))
         J_t = J[:, 3:6]
         J_r = J[:, :3]
         J_ext = np.concatenate((J_t, J_r), axis=1)
         J_f = J[:, 7:8]
         J_calib = np.concatenate((J_ext, J_f), axis=1)
-        delta = projected_points - image_points
-        delta = delta.reshape((num_pairs * 2, 1))
+        residuals = image_points - projected_points
+        residuals = residuals.reshape((num_pairs * 2, 1))
 
-        err0 = np.linalg.norm(image_points - projected_points)
+        err0 = euclidean_dist(projected_points, image_points)
 
         J_in = J_calib
 
-        t_start = time.time()
         H = J_in.T.dot(J_in)
         H_damped = H + lmbda * np.eye(H.shape[0])
-        b = -J_in.T.dot(delta)
+        b = J_in.T.dot(residuals)
 
         update = np.linalg.solve(H_damped, b)
-
-        t_end = time.time()
-        total_time_solve += np.round((t_end - t_start) * 1000, 3)
 
         tvec0[0] += update[0]
         tvec0[1] += update[1]
@@ -89,108 +81,55 @@ def LM7DoF(object_points, image_points, rvec0, tvec0, camera_matrix, iterations)
         camera_matrix[0, 0] += update[6]
         camera_matrix[1, 1] += update[6]
 
-        print("Translation: ", np.round(tvec0, 3), " | Rotation: ",
-              np.round(rvec0, 3), " F: ", camera_matrix[0, 0], " | Reprojection error: ", np.round(err0, 4))
+        if log:
+            print("Iter: ", iter, " | Translation: ", np.round(tvec0, 3),
+                  " | Rotation: ", np.round(rvec0, 3), " F: ", camera_matrix[0, 0],
+                  " | Reprojection error: ", np.round(err0, 4))
 
-        print("---------------------------------------------------"
-              "--------------------------------------------------------------------------")
+            print("---------------------------------------------------"
+                  "--------------------------------------------------------------------------")
 
         if err0 < 1e-1:
             break
-    t_end0 = time.time()
-    dur0_ms = np.round((t_end0 - t_start0) * 1000, 3)
 
-    print("Total time for Jacobian computation: ", np.round(total_time_jac_compute, 3), " ms")
-    print("Total time for solving the linear system: ", np.round(total_time_solve, 3), " ms")
-    print("Total time for the whole process: ", dur0_ms, " ms")
-
-    return rvec0, tvec0, camera_matrix
+    return rvec0, tvec0, camera_matrix, err0
 
 
-# I derive the Jacobian for the PnP problem
-def pnp_gauss_newton_exp_map(object_points, image_points, rvec, tvec, camera_matrix, iterations):
-    num_pairs = len(object_points)
-    se3 = convert_pose_to_se3(rvec, tvec)
-    fx = camera_matrix[0, 0]
-    fy = camera_matrix[1, 1]
-    cx = camera_matrix[0, 2]
-    cy = camera_matrix[1, 2]
-    print("SE3 Initial Translation: \n", se3.translation())
-    print("SE3 Initial Rotation: \n", se3.rotationMatrix())
+def euclidean_dist(projected_points, image_points):
+    dist_total = 0
+    for i in range(len(projected_points)):
+        dist_total += math.sqrt((projected_points[i][0] - image_points[i][0]) ** 2 + (
+                projected_points[i][1] - image_points[i][1]) ** 2)
+    return dist_total/len(projected_points)
 
-    print("-------------------------------------------")
-
-    for i in range(iterations):
-        H = np.zeros((6, 6))
-        b = np.zeros((6, 1))
-        cost = 0
-        for j in range(num_pairs):
-            object_point = object_points[j].reshape(3, 1)
-            pc = se3 * object_point
-            inv_z = 1.0 / pc[2]
-            inv_z2 = inv_z ** 2
-            proj = np.zeros((2, 1))
-            proj[0] = fx * pc[0] / pc[2] + cx
-            proj[1] = fy * pc[1] / pc[2] + cy
-            e = image_points[j].reshape(2, 1) - proj
-            cost += math.sqrt(e[0] ** 2 + e[1] ** 2)
-
-            J = np.zeros((2, 6))
-            J[0, 0] = -fx * inv_z
-            J[0, 1] = 0
-            J[0, 2] = fx * pc[0] * inv_z2
-            J[0, 3] = fx * pc[0] * pc[1] * inv_z2
-            J[0, 4] = -fx - fx * pc[0] * pc[0] * inv_z2
-            J[0, 5] = fx * pc[1] * inv_z
-
-            J[1, 0] = 0
-            J[1, 1] = -fy * inv_z
-            J[1, 2] = fy * pc[1] * inv_z2
-            J[1, 3] = fy + fy * pc[1] * pc[1] * inv_z2
-            J[1, 4] = -fy * pc[0] * pc[1] * inv_z2
-            J[1, 5] = -fy * pc[0] * inv_z
-
-            H += J.T.dot(J)
-            b += -J.T.dot(e)
-
-        print("Iter:", i, " | Exp Cost:", cost / num_pairs)
-
-        # Solve Hx = b
-        dx = np.linalg.solve(H, b)
-        dx_exp = sophus.SE3.exp(dx)
-
-        # Update pose estimate
-        se3 = dx_exp * se3
-
-    print("-------------------------------------------")
-    print("SE3 Final Translation: \n", se3.translation())
-    print("SE3 Final Rotation: \n", se3.rotationMatrix())
-
-    return se3.translation(), se3.rotationMatrix()
-
-
+# Define ground truth camera parameters:
 width = 1920
 height = 1080
 fy = 1200
 fx = fy
 cx = width / 2
 cy = height / 2
-
-image_points = []
-object_points = []
-
 T_world_cam = np.eye(4)
-tx = 0.15
-ty = 0.19
-tz = 0.233
+tx = 0.0
+ty = 0.0
+tz = 0.4
 T_world_cam[0, 3] = tx
 T_world_cam[1, 3] = ty
 T_world_cam[2, 3] = tz
-
 print("Ground truth values: fx:", fx, "fy:", fy, "tx:", -tx, "ty:", -ty, "tz:", -tz)
 
-count_pairs = 100
-for i in range(count_pairs):
+count_pairs = 150
+outlier_ratio = 0.35
+err_var = 0.4
+outlier_count = int(count_pairs * outlier_ratio)
+inlier_count = count_pairs - outlier_count
+
+image_points_inlier, image_points_outlier = [], []
+object_points_inlier, object_points_outlier = [], []
+
+# ADD Inlier points
+inlier_indices_gt = np.arange(inlier_count, dtype=np.int32)
+for i in range(inlier_count):
     # define rand pixel loc
     x = np.random.randint(0, width)
     y = np.random.randint(0, height)
@@ -198,17 +137,135 @@ for i in range(count_pairs):
     depth = np.random.randint(1, 10)
     point_cam = np.array([(x - cx) * depth / fx, (y - cy) * depth / fy, depth], dtype=np.float32)
     point_world = T_world_cam.dot(np.append(point_cam, 1))[:3]
-    image_points.append(np.array([x, y], dtype=np.float32))
-    object_points.append(point_world)
+    image_points_inlier.append(np.array([x, y], dtype=np.float32))
+    object_points_inlier.append(point_world)
 
-rvec_init = np.array([0, 0, 0], dtype=np.float32)
-tvec_init = np.array([0, 0, 0.0], dtype=np.float32)
+# define outlier points
+while len(image_points_outlier) < outlier_count:
+    # define rand pixel loc
+    x = np.random.randint(0, width)
+    y = np.random.randint(0, height)
+    # define rand depth
+    depth = np.random.randint(1, 10)
+    point_cam = np.array([(x - cx) * depth / fx, (y - cy) * depth / fy, depth], dtype=np.float32)
+    point_world = T_world_cam.dot(np.append(point_cam, 1))[:3]
+    # add gaussian noise
+    point_world[0] += np.random.normal(0, err_var)
+    point_world[1] += np.random.normal(0, err_var)
+    b_in_image = 0 <= x < width and 0 <= y < height
+    if b_in_image:
+        image_points_outlier.append(np.array([x, y], dtype=np.float32))
+        object_points_outlier.append(point_world)
 
+# define inlier and outlier indices
+inlier_indices_array = np.arange(inlier_count, dtype=np.int32)
+outlier_indices_array = np.arange(inlier_count, inlier_count + outlier_count, dtype=np.int32)
+
+object_points_combined = np.array(object_points_inlier + object_points_outlier)
+image_points_combined = np.array(image_points_inlier + image_points_outlier)
+
+print("Inlier count: ", len(image_points_inlier))
+print("Outlier count: ", len(image_points_outlier))
+
+# Define initial values to bre refined
+rvec_init = np.array([0, 0, 0.0], dtype=np.float32)
+tvec_init = np.array([0, 0, 0], dtype=np.float32)
 fy_init = 1600
 fx_init = fy_init
 camera_matrix_init = np.array([[fy_init, 0, cx], [0, fy_init, cy], [0, 0, 1]], dtype=np.float32)
 
-rvec, tvec, camera_matrix = LM7DoF(np.array(object_points), np.array(image_points), rvec_init, tvec_init,
-                                   camera_matrix_init, 6)
-                                   
-                                   
+t_start = time.time()
+rvec, tvec, camera_matrix, err = LM7DoF(object_points_combined, image_points_combined,
+                                        rvec_init, tvec_init,
+                                        camera_matrix_init, 6, True)
+print("Last translation: ", tvec, " | Last rotation: ", rvec, " F: ", camera_matrix[0, 0], " | Reprojection error: ", err)
+t_end = time.time()
+dur_ms_avg = (t_end - t_start)
+print("Time for run: ", dur_ms_avg, " ms")
+
+print("\n\n\n\n\n")
+
+# Run LM - with RANSAC
+t_start = time.time()
+num_run = 100
+num_cam_select = 5
+ransac_threshold = 3
+num_total_cam = object_points_combined.shape[0]
+
+best_err = 1e10
+best_inlier_indices = []
+best_outlier_indices = []
+best_run_id = 0
+best_inlier_count = 0
+best_tvec = np.array([0, 0, 0], dtype=np.float32)
+best_f = 0
+
+for i in range(num_run):
+    print("Run: ", i)
+    indices = np.random.choice(num_total_cam, num_cam_select, replace=False)
+    c_inlier_in, c_outlier_in = 0, 0
+    for index in indices:
+        if index in inlier_indices_array:
+            c_inlier_in += 1
+        else:
+            c_outlier_in += 1
+    print("Selected inlier ", c_inlier_in, " | Selected outlier ", c_outlier_in)
+
+    object_point_ransac = object_points_combined[indices]
+    image_point_ransac = image_points_combined[indices]
+
+
+    rvec_init = np.array([0, 0, 0.0], dtype=np.float32)
+    tvec_init = np.array([0, 0, 0], dtype=np.float32)
+    fy_init = 1600
+    fx_init = fy_init
+    camera_matrix_init = np.array([[fy_init, 0, cx], [0, fy_init, cy], [0, 0, 1]], dtype=np.float32)
+
+    rvec, tvec, camera_matrix, err = LM7DoF(object_point_ransac, image_point_ransac,
+                                            rvec_init, tvec_init, camera_matrix_init, 6, False)
+
+    # Evaluate solution
+    c_inlier = 0
+    inlier_indices_solution, outlier_indices_solution = [], []
+    projected_points = cv2.projectPoints(object_points_combined, rvec, tvec, camera_matrix, None)[0]
+    for j in range(num_total_cam):
+        err_sample = np.linalg.norm(image_points_combined[j] - projected_points[j])
+        err_sample = math.sqrt(err_sample)
+        if err_sample < ransac_threshold:
+            inlier_indices_solution.append(j)
+            c_inlier += 1
+        else:
+            outlier_indices_solution.append(j)
+
+    print("Solution inlier count: ", len(inlier_indices_solution), " | Solution outlier count: ", len(outlier_indices_solution))
+
+    if c_inlier > best_inlier_count:
+        best_inlier_count = c_inlier
+        best_err = err
+        best_tvec = tvec
+        best_f = camera_matrix[0, 0]
+        best_inlier_indices = inlier_indices_solution
+        best_outlier_indices = outlier_indices_solution
+        best_run_id = i
+
+
+
+
+    print("------------------------------------------------------------------------------------------------")
+
+print("\n\n\n")
+
+print("Best inlier count: ", best_inlier_count, " | Best outlier count: ", object_points_combined.shape[0] - best_inlier_count)
+print("Best run:", best_run_id, " | Best error: ", np.round(best_err, 3), " | Best translation: ", np.round(best_tvec, 3), " | Best F: ", best_f)
+
+print("Outlier intersection ratio: ", len(set(best_outlier_indices).intersection(set(outlier_indices_array)))/len(outlier_indices_array))
+
+
+t_end = time.time()
+dur_ms = (t_end - t_start) * 1000
+print("Time for run: ", dur_ms, " ms")
+
+
+
+
+
